@@ -51,6 +51,14 @@ pub unsafe fn init_queue() -> *mut SharedQueue {
         &mut found as *mut bool,
     ) as *mut SharedQueue;
 
+    if queue.is_null() {
+        ereport!(
+            ERROR,
+            PgSqlErrorCode::ERRCODE_OUT_OF_MEMORY,
+            "pg_otel_tracer: failed to allocate shared memory queue"
+        );
+    }
+
     if !found {
         // Postgres has already zeroed the memory; we just need to
         // initialise the atomics so their vtable pointers are valid.
@@ -64,6 +72,7 @@ pub unsafe fn init_queue() -> *mut SharedQueue {
 }
 
 unsafe fn lock_queue(q: *mut SharedQueue) {
+    let mut spins = 0;
     while (*q).lock.compare_exchange_weak(
         false,
         true,
@@ -71,6 +80,11 @@ unsafe fn lock_queue(q: *mut SharedQueue) {
         Ordering::Relaxed,
     ).is_err() {
         std::hint::spin_loop();
+        spins += 1;
+        if spins > 100 {
+            std::thread::yield_now();
+            spins = 0;
+        }
     }
 }
 
@@ -106,6 +120,9 @@ pub unsafe fn queue_push(queue: *mut SharedQueue, data: &[u8]) -> bool {
         data.len(),
     );
     q.lengths[slot] = data.len();
+    // Ensure the buffer write is visible to other CPUs before we publish
+    // the new write index.  Critical on weakly-ordered architectures (ARM).
+    std::sync::atomic::fence(Ordering::Release);
     q.write_idx.store(write_idx.wrapping_add(1), Ordering::Relaxed);
 
     unlock_queue(queue);
