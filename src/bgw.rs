@@ -3,7 +3,6 @@ use pgrx::bgworkers::{BackgroundWorker, BackgroundWorkerBuilder, SignalWakeFlags
 use std::panic;
 use std::time::Duration;
 
-use crate::config;
 use crate::exporter::export_batch;
 use crate::shared::{get_queue, queue_pop};
 
@@ -17,7 +16,7 @@ pub fn register_worker() {
         .set_function("pg_otel_worker_main")
         .set_argument(0i32.into_datum())
         .set_restart_time(Some(Duration::from_secs(10)))
-        .set_flags(pg_sys::BGWORKER_SHMEM_ACCESS as i32)
+        .enable_spi_access()
         .load();
 }
 
