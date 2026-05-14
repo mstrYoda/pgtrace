@@ -1,6 +1,7 @@
 use pgrx::prelude::*;
 use std::ffi::CStr;
 
+use crate::config;
 use crate::parser::{extract_traceparent, TraceContext};
 use crate::shared::{get_queue, queue_push};
 use crate::span::*;
@@ -38,12 +39,17 @@ static mut PREV_SHMEM_REQUEST_HOOK: Option<unsafe extern "C" fn()> = None;
 // Per-backend thread-local state
 // ─────────────────────────────────────────────────────────────
 
+/// Maximum spans to buffer per backend before forcing an early flush.
+/// Prevents unbounded memory growth during long transactions.
+const MAX_BUFFERED_SPANS: usize = 64;
+
 thread_local! {
     static TRACE_CTX: std::cell::RefCell<Option<TraceContext>> = std::cell::RefCell::new(None);
     static SPAN_BUFFER: std::cell::RefCell<Vec<RawSpan>> = std::cell::RefCell::new(Vec::new());
     static PLANNER_SPAN: std::cell::RefCell<Option<RawSpan>> = std::cell::RefCell::new(None);
     static EXEC_SPAN: std::cell::RefCell<Option<RawSpan>> = std::cell::RefCell::new(None);
-    static RUN_SPAN: std::cell::RefCell<Option<RawSpan>> = std::cell::RefCell::new(None);
+    // Vec for re-entrant ExecutorRun calls (cursors, portals).
+    static RUN_SPANS: std::cell::RefCell<Vec<RawSpan>> = std::cell::RefCell::new(Vec::new());
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -112,16 +118,29 @@ unsafe extern "C" fn planner_hook(
     cursor_options: i32,
     bound_params: pg_sys::ParamListInfo,
 ) -> *mut pg_sys::PlannedStmt {
+    if !config::is_enabled() {
+        return if let Some(prev) = PREV_PLANNER_HOOK {
+            prev(parse, query_string, cursor_options, bound_params)
+        } else {
+            pg_sys::standard_planner(parse, query_string, cursor_options, bound_params)
+        };
+    }
+
     let qstr = if query_string.is_null() {
         String::new()
     } else {
         CStr::from_ptr(query_string).to_string_lossy().into_owned()
     };
 
+    // Extract traceparent and decide whether to trace this query.
     if let Some(ctx) = extract_traceparent(&qstr) {
-        let span = start_span("planner", &ctx, None);
-        PLANNER_SPAN.with(|s| *s.borrow_mut() = Some(span));
-        TRACE_CTX.with(|t| *t.borrow_mut() = Some(ctx));
+        if config::should_sample() {
+            let span = start_span("planner", &ctx, None);
+            PLANNER_SPAN.with(|s| *s.borrow_mut() = Some(span));
+            TRACE_CTX.with(|t| *t.borrow_mut() = Some(ctx));
+        }
+        // If sampling skipped, don't set TRACE_CTX — downstream hooks
+        // will not see a context and will passthrough without tracing.
     }
 
     let result = if let Some(prev) = PREV_PLANNER_HOOK {
@@ -145,6 +164,15 @@ unsafe extern "C" fn planner_hook(
 
 #[pg_guard]
 unsafe extern "C" fn executor_start_hook(query_desc: *mut pg_sys::QueryDesc, eflags: i32) {
+    if !config::is_enabled() {
+        if let Some(prev) = PREV_EXECUTOR_START_HOOK {
+            prev(query_desc, eflags);
+        } else {
+            pg_sys::standard_ExecutorStart(query_desc, eflags);
+        }
+        return;
+    }
+
     if !query_desc.is_null() {
         let source_text = if (*query_desc).sourceText.is_null() {
             String::new()
@@ -199,6 +227,15 @@ unsafe extern "C" fn executor_run_hook(
     count: u64,
     execute_once: bool,
 ) {
+    if !config::is_enabled() {
+        if let Some(prev) = PREV_EXECUTOR_RUN_HOOK {
+            prev(query_desc, direction, count, execute_once);
+        } else {
+            pg_sys::standard_ExecutorRun(query_desc, direction, count, execute_once);
+        }
+        return;
+    }
+
     let ctx = TRACE_CTX.with(|t| t.borrow().clone());
 
     if let Some(ref c) = ctx {
@@ -217,7 +254,7 @@ unsafe extern "C" fn executor_run_hook(
             );
         }
 
-        RUN_SPAN.with(|s| *s.borrow_mut() = Some(span));
+        RUN_SPANS.with(|s| s.borrow_mut().push(span));
     }
 
     if let Some(prev) = PREV_EXECUTOR_RUN_HOOK {
@@ -227,8 +264,8 @@ unsafe extern "C" fn executor_run_hook(
     }
 
     if ctx.is_some() {
-        RUN_SPAN.with(|s| {
-            if let Some(mut span) = s.borrow_mut().take() {
+        RUN_SPANS.with(|s| {
+            if let Some(mut span) = s.borrow_mut().pop() {
                 // Sample wait events after execution.
                 if let Some(we) = sample_wait_event() {
                     add_event(
@@ -260,6 +297,15 @@ unsafe extern "C" fn executor_run_hook(
 
 #[pg_guard]
 unsafe extern "C" fn executor_end_hook(query_desc: *mut pg_sys::QueryDesc) {
+    if !config::is_enabled() {
+        if let Some(prev) = PREV_EXECUTOR_END_HOOK {
+            prev(query_desc);
+        } else {
+            pg_sys::standard_ExecutorEnd(query_desc);
+        }
+        return;
+    }
+
     let ctx = TRACE_CTX.with(|t| t.borrow().clone());
 
     if ctx.is_some() {
@@ -270,29 +316,7 @@ unsafe extern "C" fn executor_end_hook(query_desc: *mut pg_sys::QueryDesc) {
         });
 
         // Flush the accumulated span batch to shared memory.
-        SPAN_BUFFER.with(|buf| {
-            let spans = buf.borrow_mut().drain(..).collect::<Vec<_>>();
-            if !spans.is_empty() {
-                match serde_json::to_vec(&spans) {
-                    Ok(data) => {
-                        let queue = get_queue();
-                        if !queue.is_null() {
-                            if !queue_push(queue, &data) {
-                                warning!(
-                                    "pg_otel_tracer: shared memory queue full, spans dropped"
-                                );
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        warning!(
-                            "pg_otel_tracer: failed to serialize spans: {}",
-                            e
-                        );
-                    }
-                }
-            }
-        });
+        flush_spans_to_queue();
 
         TRACE_CTX.with(|t| *t.borrow_mut() = None);
     }
@@ -326,6 +350,35 @@ fn finish_span(mut span: RawSpan) {
     span.end_time_unix_nano = now_nanos();
     SPAN_BUFFER.with(|buf| {
         buf.borrow_mut().push(span);
+        if buf.borrow().len() >= MAX_BUFFERED_SPANS {
+            // Force an early flush to shared memory so the backend
+            // never holds an unbounded number of spans in RAM.
+            flush_spans_to_queue();
+        }
+    });
+}
+
+/// Flush the current span buffer into the shared-memory queue.
+/// Called automatically when the buffer is full, or at ExecutorEnd.
+fn flush_spans_to_queue() {
+    SPAN_BUFFER.with(|buf| {
+        let spans = buf.borrow_mut().drain(..).collect::<Vec<_>>();
+        if spans.is_empty() {
+            return;
+        }
+        match serde_json::to_vec(&spans) {
+            Ok(data) => unsafe {
+                let queue = get_queue();
+                if !queue.is_null() {
+                    if !queue_push(queue, &data) {
+                        config::maybe_warn_queue_full();
+                    }
+                }
+            },
+            Err(e) => {
+                warning!("pg_otel_tracer: failed to serialize spans: {}", e);
+            }
+        }
     });
 }
 
