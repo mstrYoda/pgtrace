@@ -1,0 +1,68 @@
+version: "3.8"
+
+services:
+  postgres:
+    build:
+      context: .
+      dockerfile: Dockerfile.pg_otel
+    container_name: postgres-otel
+    environment:
+      POSTGRES_PASSWORD: secret
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318/v1/traces
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - otel
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.102.1
+    container_name: otel-collector
+    command: ["--config=/etc/otel-collector-config.yaml"]
+    volumes:
+      - ./otel-collector-config.yaml:/etc/otel-collector-config.yaml
+    ports:
+      - "4317:4317"   # OTLP gRPC
+      - "4318:4318"   # OTLP HTTP
+    networks:
+      - otel
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.58
+    container_name: jaeger
+    ports:
+      - "16686:16686"   # Jaeger UI
+    networks:
+      - otel
+
+  demo-go:
+    build:
+      context: ./demo-go
+      dockerfile: Dockerfile
+    container_name: demo-go
+    environment:
+      DATABASE_URL: "host=postgres user=postgres password=secret dbname=postgres port=5432 sslmode=disable"
+      OTEL_EXPORTER_OTLP_ENDPOINT: otel-collector:4318
+      PORT: "8080"
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      otel-collector:
+        condition: service_started
+    networks:
+      - otel
+
+volumes:
+  pgdata:
+
+networks:
+  otel:
+    driver: bridge

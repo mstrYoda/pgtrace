@@ -1,0 +1,33 @@
+# Dockerfile.pg_otel
+# Builds pg_otel_tracer inside a Postgres 16 (Debian Bookworm) image.
+
+FROM postgres:16-bookworm
+
+# Install build dependencies + Rust toolchain
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl ca-certificates build-essential libssl-dev pkg-config \
+    postgresql-server-dev-16 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+# Install pgrx and point it to the system Postgres
+RUN cargo install cargo-pgrx --version 0.11.2 --locked
+RUN cargo pgrx init --pg16=$(which pg_config)
+
+# Build the extension
+WORKDIR /build
+COPY . .
+
+RUN cargo pgrx package --pg-config $(which pg_config)
+
+# Install extension files into Postgres system directories
+RUN cp target/release/pg_otel_tracer-pg16/usr/share/postgresql/16/extension/* \
+       /usr/share/postgresql/16/extension/ \
+    && cp target/release/pg_otel_tracer-pg16/usr/lib/postgresql/16/lib/* \
+       /usr/lib/postgresql/16/lib/
+
+# Ensure the extension is preloaded in any new cluster
+RUN echo "shared_preload_libraries = 'pg_otel_tracer'" \
+    >> /usr/share/postgresql/postgresql.conf.sample
