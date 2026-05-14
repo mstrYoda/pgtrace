@@ -17,6 +17,7 @@ pub fn register_worker() {
         .set_function("pg_otel_worker_main")
         .set_argument(0i32.into_datum())
         .set_restart_time(Some(Duration::from_secs(10)))
+        .set_flags(pg_sys::BGWORKER_SHMEM_ACCESS as i32)
         .load();
 }
 
@@ -25,7 +26,6 @@ pub fn register_worker() {
 #[no_mangle]
 pub extern "C" fn pg_otel_worker_main(_arg: pg_sys::Datum) {
     BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGHUP | SignalWakeFlags::SIGTERM);
-    BackgroundWorker::connect_worker_to_spi(Some("postgres"), None);
 
     log!("pg_otel_tracer: background worker started");
 
