@@ -3,6 +3,7 @@ use pgrx::prelude::*;
 pgrx::pg_module_magic!();
 
 mod bgw;
+mod config;
 mod exporter;
 mod hooks;
 mod parser;
@@ -15,6 +16,14 @@ mod wait_events;
 /// in `shared_preload_libraries` in postgresql.conf.
 #[pg_guard]
 pub extern "C" fn _PG_init() {
+    // Read environment-variable overrides before hook installation.
+    if let Ok(v) = std::env::var("PG_OTEL_TRACER_ENABLED") {
+        config::set_enabled(v.parse().unwrap_or(true));
+    }
+    if let Ok(v) = std::env::var("PG_OTEL_TRACER_SAMPLE_RATE") {
+        config::set_sample_rate(v.parse().unwrap_or(1.0));
+    }
+
     // PG15+ requires shared-memory requests to happen inside shmem_request_hook.
     // During initdb (bootstrap) there is no postmaster, so the hook is never
     // triggered and we avoid the fatal error.
@@ -38,15 +47,30 @@ fn pg_otel_tracer_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
-/// SQL-callable table function returning runtime status metrics.
+/// SQL-callable function returning runtime status metrics.
 #[pg_extern]
 fn pg_otel_tracer_status() -> TableIterator<'static, (name!(metric, String), name!(value, String))> {
     let stats = shared::queue_stats();
     TableIterator::new(vec![
         ("version".into(), env!("CARGO_PKG_VERSION").into()),
+        ("enabled".into(), config::is_enabled().to_string()),
         ("queue_size".into(), stats.size.to_string()),
         ("queue_dropped".into(), stats.dropped.to_string()),
     ])
+}
+
+/// Enable or disable tracing at runtime.
+#[pg_extern]
+fn pg_otel_tracer_set_enabled(enabled: bool) {
+    config::set_enabled(enabled);
+    log!("pg_otel_tracer: tracing {}", if enabled { "enabled" } else { "disabled" });
+}
+
+/// Set the sampling rate (0.0 = none, 1.0 = all).
+#[pg_extern]
+fn pg_otel_tracer_set_sample_rate(rate: f64) {
+    config::set_sample_rate(rate);
+    log!("pg_otel_tracer: sample rate set to {}", rate.clamp(0.0, 1.0));
 }
 
 // ─────────────────────────────────────────────────────────────
