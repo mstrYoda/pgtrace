@@ -1,0 +1,6 @@
+[build]
+# For Linux cross-compilation from macOS, uncomment the target and linker below:
+# target = "x86_64-unknown-linux-gnu"
+
+[target.x86_64-unknown-linux-gnu]
+linker = "x86_64-linux-musl-gcc"

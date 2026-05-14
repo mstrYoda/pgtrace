@@ -1,0 +1,39 @@
+[package]
+name = "pg_otel_tracer"
+version = "0.1.0"
+edition = "2021"
+authors = ["SRE Team <sre@example.com>"]
+description = "OpenTelemetry tracing extension for PostgreSQL using pgrx"
+license = "Apache-2.0"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[features]
+default = ["pg16"]
+pg13 = ["pgrx/pg13", "pgrx-tests/pg13"]
+pg14 = ["pgrx/pg14", "pgrx-tests/pg14"]
+pg15 = ["pgrx/pg15", "pgrx-tests/pg15"]
+pg16 = ["pgrx/pg16", "pgrx-tests/pg16"]
+pg_test = []
+
+[dependencies]
+pgrx = "=0.11.2"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+regex = "1.10"
+lazy_static = "1.4"
+rand = "0.8"
+ureq = "2.9"
+
+[dev-dependencies]
+pgrx-tests = "=0.11.2"
+
+[profile.dev]
+panic = "unwind"
+
+[profile.release]
+panic = "unwind"
+opt-level = 3
+lto = "fat"
+codegen-units = 1
