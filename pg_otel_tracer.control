@@ -1,0 +1,6 @@
+comment = 'OpenTelemetry tracing extension for PostgreSQL'
+default_version = '0.1.0'
+module_pathname = '$libdir/pg_otel_tracer'
+relocatable = false
+superuser = true
+schema = 'pg_catalog'
