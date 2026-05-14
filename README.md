@@ -1,171 +1,70 @@
 # pg_otel_tracer
 
-<p align="center">
-  <strong>OpenTelemetry Tracing Extension for PostgreSQL</strong><br>
-  Bridge the observability gap between your backend APIs and Postgres.
-</p>
-
-<p align="center">
-  <a href="#features">Features</a> •
-  <a href="#architecture">Architecture</a> •
-  <a href="#quick-start">Quick Start</a> •
-  <a href="#docker-full-stack">Docker Stack</a> •
-  <a href="#configuration">Configuration</a> •
-  <a href="#how-it-works">How It Works</a>
-</p>
-
----
-
-## Overview
-
-`pg_otel_tracer` is a PostgreSQL extension written in **Rust** (via [pgrx](https://github.com/pgcentralfoundation/pgrx)) that extracts W3C `traceparent` IDs from SQL comments ([sqlcommenter](https://google.github.io/sqlcommenter/) format) and exports OpenTelemetry spans for query lifecycle events — without blocking the database backend.
-
-If your backend API is already instrumented with OpenTelemetry, this extension lets you **see inside Postgres** as part of the same distributed trace.
+OpenTelemetry tracing extension for PostgreSQL. Extracts W3C `traceparent` from SQL comments and exports query lifecycle spans via OTLP/HTTP.
 
 ```
-┌─────────────────┐      sqlcommenter          ┌─────────────────┐
-│  Backend API    │ ── SELECT ... /*tp=...*/──>│   PostgreSQL    │
-│  (traceparent)  │                            │  ┌───────────┐  │
-└─────────────────┘                            │  │  Hooks    │  │
-                                               │  │(Planner   │  │
-                                               │  │ Executor) │  │
-                                               │  └─────┬─────┘  │
-                                               │        │        │
-                                               │  ┌─────▼─────┐  │
-                                               │  │ Shared    │  │
-                                               │  │ Memory    │  │
-                                               │  │ Ring Buf  │  │
-                                               │  └─────┬─────┘  │
-                                               │        │        │
-                                               │  ┌─────▼─────┐  │
-                                               │  │ Background│  │
-                                               │  │ Worker    │  │
-                                               │  │ (OTLP)    │  │
-                                               │  └─────┬─────┘  │
-                                               └────────┼────────┘
-                                                        │
-                                                        ▼
-                                                ┌─────────────────┐
-                                                │  OTEL Collector │
-                                                │ (Jaeger/Tempo)  │
-                                                └─────────────────┘
+Backend API          PostgreSQL                  OTEL Collector
+     │    SQL + traceparent    │                       │
+     │ ──────────────────────> │  planner span         │
+     │                         │  query execution span │
+     │                         │  executor run span    │
+     │                         │ ────────┬───────────> │
+     │                         │  Shared │ Memory      │
+     │                         │  Queue  │             │
+     │                         │ ────────┘             │
 ```
 
----
+## What It Does
 
-## Features
+1. Your app injects `traceparent` into SQL comments (sqlcommenter)
+2. The extension intercepts query hooks (`planner`, `ExecutorStart`, `ExecutorRun`, `ExecutorEnd`)
+3. Spans are batched in shared memory and exported asynchronously by a background worker
+4. You see the full trace in Jaeger/Tempo — from HTTP handler down to Postgres internals
 
-- **Trace Context Extraction** — Parses W3C `traceparent` from sqlcommenter-style SQL comments.
-- **Query Lifecycle Spans** — Emits spans for `planner`, `query execution`, and `executor run`.
-- **Wait Event Sampling** — Captures Postgres lock and I/O wait events during query execution.
-- **Asynchronous Export** — Background worker drains spans from shared memory and exports via OTLP/HTTP JSON.
-- **Non-Blocking** — Shared-memory ring buffer ensures hooks never wait on I/O.
-- **Zero Configuration** — Works out of the box with any OTLP-compatible collector.
-
----
-
-## Architecture
-
-### Hook Points
-
-The extension intercepts four Postgres hooks to trace the full query lifecycle:
-
-| Hook | Span Created | What It Measures |
-|------|-------------|------------------|
-| `planner_hook` | `planner` | Query planning & optimization |
-| `ExecutorStart_hook` | `query execution` | Overall execution start |
-| `ExecutorRun_hook` | `executor run` | Data retrieval / scan |
-| `ExecutorEnd_hook` | — | Finalizes spans, flushes to queue |
-
-### Per-Span Data
-
-- **Timing**: `startTimeUnixNano` / `endTimeUnixNano` for every phase
-- **Row Count**: `db.row_count` from `estate->es_processed`
-- **Wait Events**: `wait_event_before` and `wait_event_after` events sampling `MyProc->wait_event_info`
-- **Parent ID**: Extracted from `/*traceparent='00-<trace_id>-<parent_id>-<flags>'*/`
-
-### Background Worker (BGW)
-
-A separate OS process reads batches from the shared-memory ring buffer and exports them via OTLP/HTTP JSON to your collector. The backend process never performs I/O.
-
----
-
-## Quick Start
-
-### Prerequisites
-
-- Docker & Docker Compose
-- (Optional) Rust 1.70+ if building locally
-
-### Docker Full Stack
-
-The fastest way to see everything working end-to-end is using the provided Docker Compose stack, which includes:
-
-- **PostgreSQL 16** with `pg_otel_tracer` preloaded
-- **OpenTelemetry Collector**
-- **Jaeger** (trace viewer UI)
-- **Go Demo App** (GORM + traceparent injection)
+## Quick Start (Docker)
 
 ```bash
-# Clone and start everything
-cd /path/to/postgres-extension
+git clone https://github.com/mstrYoda/pg_otel_tracer.git
+cd pg_otel_tracer
 docker compose up --build
 ```
 
-> **Note:** The first build compiles the Rust extension inside the Postgres image. This takes 5–15 minutes. Grab coffee.
-
-Once running:
+This starts Postgres 16 + OTEL Collector + Jaeger + Go demo app.
 
 ```bash
-# Create a user via the Go API
+# Send a traced request
 curl -X POST http://localhost:8080/users \
-  -H "Content-Type: application/json" \
   -d '{"name":"Alice","email":"alice@example.com"}'
 
-# List users
-curl http://localhost:8080/users
+# View traces
+open http://localhost:16686
 ```
 
-Open [http://localhost:16686](http://localhost:16686) in Jaeger and search for the `demo-go` service. You will see the full distributed trace including the Postgres `planner`, `query execution`, and `executor run` spans.
-
-### Stopping
-
-```bash
-docker compose down        # stop
-docker compose down -v     # stop + wipe data
-```
-
----
+> First build compiles the Rust extension inside the Postgres image (5–15 min).
 
 ## Manual Installation
 
-If you prefer to install the extension into an existing PostgreSQL instance:
+### Prerequisites
 
-### 1. Build
+- Rust 1.70+
+- `cargo install cargo-pgrx --version 0.11.2 --locked`
+- `cargo pgrx init`
+- PostgreSQL 13–16 dev headers
+
+### Build & Install
 
 ```bash
-# Install pgrx
-cargo install cargo-pgrx --version 0.11.2 --locked
-cargo pgrx init
-
-# Build
 cargo pgrx package --pg-config $(which pg_config)
-```
 
-### 2. Install
-
-Copy the artifacts to your Postgres directories:
-
-```bash
+# Copy artifacts to Postgres dirs
 PG_CONFIG=$(which pg_config)
-SHARE_DIR=$($PG_CONFIG --sharedir)
-LIB_DIR=$($PG_CONFIG --pkglibdir)
-
-cp target/release/pg_otel_tracer-pg16/usr/share/postgresql/16/extension/* "$SHARE_DIR/extension/"
-cp target/release/pg_otel_tracer-pg16/usr/lib/postgresql/16/lib/* "$LIB_DIR/"
+cp target/release/pg_otel_tracer-pg16/usr/share/postgresql/16/extension/* \
+   "$($PG_CONFIG --sharedir)/extension/"
+cp target/release/pg_otel_tracer-pg16/usr/lib/postgresql/16/lib/* \
+   "$($PG_CONFIG --pkglibdir)/"
 ```
 
-### 3. Configure
+### Configure PostgreSQL
 
 Add to `postgresql.conf`:
 
@@ -173,180 +72,133 @@ Add to `postgresql.conf`:
 shared_preload_libraries = 'pg_otel_tracer'
 ```
 
-Restart PostgreSQL.
-
-### 4. Create Extension
+Restart Postgres, then:
 
 ```sql
 CREATE EXTENSION pg_otel_tracer;
 ```
 
-Verify:
-
-```sql
-SELECT * FROM pg_otel_tracer_status();
---  metric      | value
--- -------------+--------
---  version     | 0.1.0
---  queue_size  | 0
---  queue_dropped| 0
-```
-
----
-
 ## Configuration
 
-The extension reads the OTLP endpoint from an environment variable:
+| Setting | How to Set | Default | Description |
+|---------|-----------|---------|-------------|
+| **Enable/disable** | `SELECT pg_otel_tracer_set_enabled(false)` | `true` | Emergency off switch — no restart needed |
+| **Sampling rate** | `SELECT pg_otel_tracer_set_sample_rate(0.1)` | `1.0` | Fraction of queries to trace (0.0–1.0) |
+| **OTLP endpoint** | `OTEL_EXPORTER_OTLP_ENDPOINT` env var | `http://localhost:4318/v1/traces` | Where spans are sent |
+| **Boot-time enable** | `PG_OTEL_TRACER_ENABLED` env var | `true` | Initial state on server startup |
+| **Boot-time sample rate** | `PG_OTEL_TRACER_SAMPLE_RATE` env var | `1.0` | Initial sampling rate |
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | `http://localhost:4318/v1/traces` | OTLP/HTTP traces endpoint |
-
-In Docker Compose, set it on the Postgres service:
-
-```yaml
-services:
-  postgres:
-    environment:
-      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318/v1/traces
-```
-
----
-
-## How It Works
-
-### 1. Your App Injects Trace Context
-
-Any backend that appends W3C `traceparent` to SQL comments will work. Example raw SQL:
+### Production Tuning Example
 
 ```sql
-SELECT id, name FROM users
+-- Start with 1% sampling to measure overhead
+SELECT pg_otel_tracer_set_sample_rate(0.01);
+
+-- Monitor queue health
+SELECT * FROM pg_otel_tracer_status();
+--  metric       | value
+-- --------------+--------
+--  version      | 0.1.0
+--  enabled      | true
+--  sample_rate  | 0.0100
+--  queue_size   | 3
+--  queue_dropped| 0
+
+-- If queue_dropped > 0, the collector can't keep up — reduce sample_rate
+-- or scale the collector. If problems persist, disable immediately:
+SELECT pg_otel_tracer_set_enabled(false);
+```
+
+## Architecture
+
+The extension uses four Postgres hooks to trace query lifecycle:
+
+| Hook | Span | What It Measures |
+|------|------|-----------------|
+| `planner_hook` | `planner` | Query optimization |
+| `ExecutorStart_hook` | `query execution` | Execution start |
+| `ExecutorRun_hook` | `executor run` | Data retrieval + wait events |
+| `ExecutorEnd_hook` | — | Finalizes spans + flushes to queue |
+
+**Thread-local buffers** store spans per backend. **Shared-memory ring buffer** (1024 slots, 8KB each) passes data to the background worker. The **BGW** exports via OTLP/HTTP JSON every 500ms.
+
+Key design decisions:
+- **Drop on overflow** — never block the database for telemetry
+- **Bounded buffer** — max 64 spans per backend before forced flush
+- **Spinlock + yield** — protects the queue without LWLock ABI fragility
+- **catch_unwind** — panics in the BGW are trapped, not propagated
+- **Exponential backoff retry** — 3 attempts on export failure
+
+## How Your App Injects Traceparent
+
+The extension reads W3C `traceparent` from SQL comments:
+
+```sql
+SELECT * FROM users
 /*traceparent='00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01'*/;
 ```
 
-The included Go demo does this automatically using a custom `sql.DB` wrapper:
-
-```go
-func injectTraceparent(ctx context.Context, query string) string {
-    sc := trace.SpanFromContext(ctx).SpanContext()
-    tp := fmt.Sprintf("00-%s-%s-%02x", sc.TraceID(), sc.SpanID(), sc.TraceFlags())
-    return query + fmt.Sprintf(" /*traceparent='%s'*/", tp)
-}
-```
-
-### 2. Extension Extracts & Traces
-
-- The `planner_hook` regex-parses the `traceparent` from `query_string`.
-- A `planner` span starts, measuring planning time.
-- `ExecutorStart_hook` starts the `query execution` span.
-- `ExecutorRun_hook` starts the `executor run` span and samples wait events.
-- `ExecutorEnd_hook` finalizes all spans, serializes them, and pushes to the shared-memory queue.
-
-### 3. Background Worker Exports
-
-Every 500ms, the BGW:
-
-1. Drains the shared-memory ring buffer (MPSC, spinlock-protected)
-2. Deserializes span batches
-3. Builds an OTLP/HTTP JSON payload
-4. POSTs it to the configured collector
-
-### 4. View in Jaeger
-
-Search for the `postgresql` service. Each traced query produces a nested span tree:
-
-```
-demo-go: POST /users
-└── postgresql: planner
-    └── postgresql: query execution
-        └── postgresql: executor run
-            ├── event: wait_event_before  {type: "Lock", event: "0x00000701"}
-            ├── attribute: db.row_count = "1"
-            └── event: wait_event_after   {type: "None", event: "0x00000000"}
-```
-
----
+The included Go demo does this automatically. For other languages, append the trace context as a trailing comment before sending the query to Postgres.
 
 ## Project Structure
 
 ```
-.
-├── src/
-│   ├── lib.rs          # Extension entry point (_PG_init), GUCs
-│   ├── hooks.rs        # Planner + ExecutorStart/Run/End hooks
-│   ├── parser.rs       # Regex traceparent extractor
-│   ├── span.rs         # RawSpan / RawEvent types + ID generation
-│   ├── shared.rs       # Shared-memory ring buffer + spinlock
-│   ├── bgw.rs          # Background worker (drain → export)
-│   ├── exporter.rs     # OTLP/HTTP JSON payload + ureq client
-│   └── wait_events.rs  # MyProc->wait_event_info decoder
-├── demo-go/            # End-to-end Go/GORM demo app
-├── Dockerfile.pg_otel  # Postgres image build
-├── docker-compose.yml  # Full stack (Postgres + Collector + Jaeger + Go)
-├── otel-collector-config.yaml
-└── Cargo.toml
+src/
+  lib.rs       # _PG_init, SQL functions
+  hooks.rs     # Planner + Executor hooks
+  parser.rs    # Traceparent regex extraction
+  span.rs      # RawSpan types + ID generation
+  shared.rs    # Shmem ring buffer + spinlock
+  bgw.rs       # Background worker (drain → export)
+  exporter.rs  # OTLP/HTTP JSON payload
+  wait_events.rs # MyProc wait event sampling
+  config.rs    # Runtime enable/sampling toggles
+demo-go/       # End-to-end Go/GORM demo
 ```
-
----
-
-## Local Development
-
-```bash
-# Run tests
-cargo pgrx test pg16
-
-# Run inside a local Postgres instance
-cargo pgrx run pg16
-
-# In psql:
-CREATE EXTENSION pg_otel_tracer;
-SELECT 1 /*traceparent='00-11111111111111111111111111111111-2222222222222222-01'*/;
-```
-
----
 
 ## Cross-Compilation
 
-To build the `.so` for Linux from macOS:
-
 ```bash
-# Install a Linux cross-compiler, e.g.:
+# macOS → Linux
 brew install FiloSottile/musl-cross/musl-cross
-
-# Edit .cargo/config.toml (example provided) to set the linker, then:
+# Edit .cargo/config.toml to set linker
 cargo build --release --target x86_64-unknown-linux-gnu
 ```
 
----
+## Testing
 
-## Known Limitations
+```bash
+# Unit tests
+cargo pgrx test pg16
 
-- **Wait event sampling is point-in-time**: Brief waits between the before/after samples may be missed. A timer-based sampler could improve coverage.
-- **No query text export**: SQL statements are intentionally not attached to spans to avoid leaking PII. This can be toggled behind a GUC in future versions.
-- **OTLP/HTTP only**: gRPC export is not yet implemented.
+# Local Postgres instance
+cargo pgrx run pg16
+```
 
----
+## Stopping
+
+```bash
+docker compose down        # stop
+docker compose down -v     # stop + wipe data
+```
+
+## Troubleshooting
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| `shared_preload_libraries` error | Extension not preloaded | Add to `postgresql.conf`, restart |
+| No spans in Jaeger | Collector unreachable | Check `OTEL_EXPORTER_OTLP_ENDPOINT`, verify collector health |
+| `queue_dropped` increasing | Collector can't keep up | Reduce `sample_rate` or scale collector |
+| High CPU | BGW restart loop | Check collector endpoint, verify network |
 
 ## Contributing
 
-Contributions are welcome! Areas we'd love help with:
-
-- GUC variables for endpoint / toggle features
+Areas for contribution:
+- GUC variables (`pg_otel_tracer.enabled` as native GUC)
 - gRPC OTLP exporter
-- Timer-based wait event sampler
 - pg_stat_statements integration
-- Support for more Postgres versions (13–15)
-
-Please open an issue or PR.
-
----
+- Support for Postgres 13–15
 
 ## License
 
 Apache-2.0
-
----
-
-<p align="center">
-  Built with <a href="https://github.com/pgcentralfoundation/pgrx">pgrx</a> and Rust.
-</p>

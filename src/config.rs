@@ -38,6 +38,12 @@ pub fn set_sample_rate(rate: f64) {
     SAMPLE_RATE_BILLIONTHS.store(billionths, Ordering::Relaxed);
 }
 
+/// Get current sampling rate [0.0, 1.0].
+pub fn get_sample_rate() -> f64 {
+    let billionths = SAMPLE_RATE_BILLIONTHS.load(Ordering::Relaxed);
+    (billionths as f64) / 1_000_000_000.0
+}
+
 /// Decide probabilistically whether to trace this query.
 pub fn should_sample() -> bool {
     let rate = SAMPLE_RATE_BILLIONTHS.load(Ordering::Relaxed);

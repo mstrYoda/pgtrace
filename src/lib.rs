@@ -54,6 +54,7 @@ fn pg_otel_tracer_status() -> TableIterator<'static, (name!(metric, String), nam
     TableIterator::new(vec![
         ("version".into(), env!("CARGO_PKG_VERSION").into()),
         ("enabled".into(), config::is_enabled().to_string()),
+        ("sample_rate".into(), format!("{:.4}", config::get_sample_rate())),
         ("queue_size".into(), stats.size.to_string()),
         ("queue_dropped".into(), stats.dropped.to_string()),
     ])
@@ -64,6 +65,12 @@ fn pg_otel_tracer_status() -> TableIterator<'static, (name!(metric, String), nam
 fn pg_otel_tracer_set_enabled(enabled: bool) {
     config::set_enabled(enabled);
     log!("pg_otel_tracer: tracing {}", if enabled { "enabled" } else { "disabled" });
+}
+
+/// Get the current sampling rate (0.0 = none, 1.0 = all).
+#[pg_extern]
+fn pg_otel_tracer_get_sample_rate() -> f64 {
+    config::get_sample_rate()
 }
 
 /// Set the sampling rate (0.0 = none, 1.0 = all).
