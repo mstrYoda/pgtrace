@@ -1,4 +1,5 @@
 use crate::span::{RawSpan, SpanStatus};
+use std::time::Duration;
 
 /// Export a batch of spans to the configured OTLP/HTTP endpoint.
 pub fn export_batch(spans: &[RawSpan]) -> Result<(), Box<dyn std::error::Error>> {
@@ -10,6 +11,7 @@ pub fn export_batch(spans: &[RawSpan]) -> Result<(), Box<dyn std::error::Error>>
     let payload = build_otlp_payload(spans);
 
     let response = ureq::post(&endpoint)
+        .timeout(Duration::from_secs(5))
         .set("Content-Type", "application/json")
         .send_string(&payload)?;
 
